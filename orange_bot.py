@@ -1,19 +1,11 @@
 #!/usr/bin/env python3
-"""Orange auto-farming helper.
-
-Features:
-- Toggle ON/OFF by Insert key.
-- Presses E, waits, finds oranges on screen, clicks them.
-- Performs movement routine and repeats.
-- Optional LLM-based recovery hints.
-
-Run:
-    python orange_bot.py --help
-"""
+"""Orange auto-farming helper."""
 
 from __future__ import annotations
 
 import argparse
+import ctypes
+import platform
 import threading
 import time
 from dataclasses import dataclass
@@ -26,7 +18,6 @@ import pyautogui
 from ollama import chat
 from pynput import keyboard
 
-
 Point = Tuple[int, int]
 
 
@@ -36,10 +27,14 @@ class BotConfig:
     post_pick_cooldown: float = 1.5
     move_duration: float = 1.5
     turn_pixels: int = 1200
-    click_pause: float = 0.1
-    orange_min_area: int = 120
-    orange_max_area: int = 60000
-    max_targets: int = 18
+    turn_duration: float = 0.3
+    turn_steps: int = 24
+    click_pause: float = 0.05
+    orange_min_area: int = 80
+    orange_max_area: int = 80000
+    orange_min_circularity: float = 0.2
+    max_targets: int = 24
+    dedup_radius: int = 30
     enable_llm: bool = False
     llm_model: str = "llama3.1:8b"
     idle_sleep: float = 0.05
@@ -60,8 +55,7 @@ class OrangeBot:
     def toggle(self) -> None:
         with self._lock:
             self.running = not self.running
-            state = "ON" if self.running else "OFF"
-            print(f"[BOT] State: {state}")
+            print(f"[BOT] State: {'ON' if self.running else 'OFF'}")
             if self.running and (self._worker is None or not self._worker.is_alive()):
                 self._worker = threading.Thread(target=self._loop, daemon=True)
                 self._worker.start()
@@ -101,7 +95,7 @@ class OrangeBot:
         for x, y in targets:
             if not self._is_running():
                 return
-            pyautogui.moveTo(x, y, duration=0.03)
+            pyautogui.moveTo(x, y, duration=0.025)
             pyautogui.click(button="left")
 
         time.sleep(self.cfg.post_pick_cooldown)
@@ -124,15 +118,18 @@ class OrangeBot:
         frame_bgr = self._capture_frame_bgr()
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
-        lower1 = np.array([4, 90, 70])
-        upper1 = np.array([25, 255, 255])
-        lower2 = np.array([0, 120, 90])
-        upper2 = np.array([4, 255, 255])
-        mask = cv2.inRange(hsv, lower1, upper1) | cv2.inRange(hsv, lower2, upper2)
+        # Broader orange ranges: bright oranges + darker oranges.
+        lower_a = np.array([3, 70, 70], dtype=np.uint8)
+        upper_a = np.array([28, 255, 255], dtype=np.uint8)
+        lower_b = np.array([0, 100, 90], dtype=np.uint8)
+        upper_b = np.array([4, 255, 255], dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower_a, upper_a) | cv2.inRange(hsv, lower_b, upper_b)
 
-        kernel = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        # Clean mask while keeping partially occluded fruits.
+        kernel3 = np.ones((3, 3), np.uint8)
+        kernel5 = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel3, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel5, iterations=2)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -143,10 +140,14 @@ class OrangeBot:
                 continue
 
             perimeter = cv2.arcLength(contour, True)
-            if perimeter == 0:
+            if perimeter <= 0:
                 continue
             circularity = (4 * np.pi * area) / (perimeter * perimeter)
-            if circularity < 0.4:
+            if circularity < self.cfg.orange_min_circularity:
+                continue
+
+            (_, _), radius = cv2.minEnclosingCircle(contour)
+            if radius < 5 or radius > 120:
                 continue
 
             m = cv2.moments(contour)
@@ -157,14 +158,25 @@ class OrangeBot:
             points.append((cx, cy))
 
         points = sorted(points, key=lambda p: (p[1], p[0]))
+        points = self._dedup_points(points, self.cfg.dedup_radius)
         return points[: self.cfg.max_targets]
 
-    def _capture_frame_bgr(self) -> np.ndarray:
-        """Grab current primary monitor frame.
+    @staticmethod
+    def _dedup_points(points: List[Point], radius: int) -> List[Point]:
+        result: List[Point] = []
+        for x, y in points:
+            duplicated = False
+            for rx, ry in result:
+                if (x - rx) * (x - rx) + (y - ry) * (y - ry) <= radius * radius:
+                    duplicated = True
+                    break
+            if not duplicated:
+                result.append((x, y))
+        return result
 
-        MSS handles are thread-local on Windows, so we create MSS in the same
-        thread where `grab()` is called to avoid `_thread._local` handle errors.
-        """
+    def _capture_frame_bgr(self) -> np.ndarray:
+        # mss internals are thread-local on Windows, so create the instance
+        # in the same thread where grab() is called.
         with mss.mss() as sct:
             monitor = sct.monitors[1]
             shot = sct.grab(monitor)
@@ -172,7 +184,47 @@ class OrangeBot:
         return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
     def turn_right_180(self) -> None:
-        pyautogui.moveRel(self.cfg.turn_pixels, 0, duration=0.25)
+        # In many games pyautogui moveRel may not rotate camera.
+        # Use native Windows relative mouse input when available.
+        if platform.system().lower().startswith("win"):
+            self._turn_right_windows_relative(self.cfg.turn_pixels, self.cfg.turn_duration, self.cfg.turn_steps)
+            return
+        pyautogui.moveRel(self.cfg.turn_pixels, 0, duration=self.cfg.turn_duration)
+
+    @staticmethod
+    def _turn_right_windows_relative(total_dx: int, duration: float, steps: int) -> None:
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [
+                ("dx", ctypes.c_long),
+                ("dy", ctypes.c_long),
+                ("mouseData", ctypes.c_ulong),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ]
+
+        class INPUT_UNION(ctypes.Union):
+            _fields_ = [("mi", MOUSEINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _anonymous_ = ("u",)
+            _fields_ = [("type", ctypes.c_ulong), ("u", INPUT_UNION)]
+
+        MOUSEEVENTF_MOVE = 0x0001
+        INPUT_MOUSE = 0
+        send_input = ctypes.windll.user32.SendInput
+
+        steps = max(1, steps)
+        step_dx = int(total_dx / steps)
+        sleep_dt = max(0.0, duration / steps)
+
+        remainder = total_dx - step_dx * steps
+        for i in range(steps):
+            dx = step_dx + (1 if i < abs(remainder) else 0) * (1 if remainder > 0 else -1)
+            inp = INPUT(type=INPUT_MOUSE, mi=MOUSEINPUT(dx=dx, dy=0, mouseData=0, dwFlags=MOUSEEVENTF_MOVE, time=0, dwExtraInfo=None))
+            send_input(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+            if sleep_dt:
+                time.sleep(sleep_dt)
 
     def hold_forward(self, duration: float) -> None:
         pyautogui.keyDown("w")
@@ -188,12 +240,8 @@ class OrangeBot:
             "press_e, rotate_left_small, rotate_right_small, step_forward, step_back, wait. "
             "State before choice: just collected oranges and may need small correction to return to tree."
         )
-
         try:
-            resp = chat(
-                model=self.cfg.llm_model,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            resp = chat(model=self.cfg.llm_model, messages=[{"role": "user", "content": prompt}])
             content = (resp.message.content if resp and resp.message else "")
             action = content.strip().split()[0].lower() if content.strip() else "wait"
             self._execute_recovery_action(action)
@@ -205,9 +253,15 @@ class OrangeBot:
         if action == "press_e":
             pyautogui.press("e")
         elif action == "rotate_left_small":
-            pyautogui.moveRel(-250, 0, duration=0.15)
+            if platform.system().lower().startswith("win"):
+                self._turn_right_windows_relative(-250, 0.15, 10)
+            else:
+                pyautogui.moveRel(-250, 0, duration=0.15)
         elif action == "rotate_right_small":
-            pyautogui.moveRel(250, 0, duration=0.15)
+            if platform.system().lower().startswith("win"):
+                self._turn_right_windows_relative(250, 0.15, 10)
+            else:
+                pyautogui.moveRel(250, 0, duration=0.15)
         elif action == "step_forward":
             self.hold_forward(0.35)
         elif action == "step_back":
@@ -224,7 +278,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--post-pick-cooldown", type=float, default=1.5)
     p.add_argument("--move-duration", type=float, default=1.5)
     p.add_argument("--turn-pixels", type=int, default=1200, help="Horizontal mouse movement for ~180°")
-    p.add_argument("--max-targets", type=int, default=18)
+    p.add_argument("--turn-duration", type=float, default=0.3)
+    p.add_argument("--max-targets", type=int, default=24)
     p.add_argument("--enable-llm", action="store_true")
     p.add_argument("--llm-model", default="llama3.1:8b")
     return p
@@ -237,6 +292,7 @@ def main() -> None:
         post_pick_cooldown=args.post_pick_cooldown,
         move_duration=args.move_duration,
         turn_pixels=args.turn_pixels,
+        turn_duration=args.turn_duration,
         max_targets=args.max_targets,
         enable_llm=args.enable_llm,
         llm_model=args.llm_model,

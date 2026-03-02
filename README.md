@@ -21,25 +21,27 @@ pip install -r requirements.txt
 python orange_bot.py
 ```
 
-Параметры:
+Пример с настройками:
 
 ```bash
-python orange_bot.py --e-cooldown 2 --post-pick-cooldown 1.5 --move-duration 1.5 --turn-pixels 1200
+python orange_bot.py --e-cooldown 2 --post-pick-cooldown 1.5 --move-duration 1.5 --turn-pixels 1400 --turn-duration 0.35 --max-targets 24
 ```
 
 ## Опционально: LLM-подсказки восстановления (через Ollama)
-
-Если установлен и запущен Ollama, скрипт может после каждого цикла делать один recovery-шаг (небольшая корректировка действий):
 
 ```bash
 ollama run llama3.1:8b
 python orange_bot.py --enable-llm --llm-model llama3.1:8b
 ```
 
-Если Ollama работает на нестандартном адресе, можно задать `OLLAMA_HOST`, например:
+Если Ollama работает на нестандартном адресе:
 
 ```bash
 export OLLAMA_HOST=http://127.0.0.1:11434
 ```
 
-> Важно: `turn-pixels` зависит от чувствительности мыши в игре. Подберите вручную, чтобы это было близко к 180°.
+## Важные замечания по точности
+
+- Если поворот не 180°, подбирайте `--turn-pixels` (обычно 900..2200 в зависимости от sensitivity).
+- Если поворот слишком резкий/медленный, подбирайте `--turn-duration`.
+- Если видит не все апельсины, увеличьте `--max-targets` и убедитесь, что апельсины реально видны в кадре (не закрыты листьями).
